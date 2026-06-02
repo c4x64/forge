@@ -89,6 +89,10 @@ typedef struct Node {
     } as;
 } Node;
 
+/* ─── Target architectures ────────────────────────────────────────── */
+#define TARGET_X86_64 0
+#define TARGET_ARM64  1
+
 /* ─── Compiler context ────────────────────────────────────────────── */
 typedef struct {
     char*     src;
@@ -96,6 +100,7 @@ typedef struct {
     Token     tokens[MAX_TOKENS];
     int       ntokens;
     int       pos;
+    int       target_arch; /* TARGET_X86_64 or TARGET_ARM64 */
     char      filename[256];
     char      labels[MAX_LABELS][64];
     int       label_addrs[MAX_LABELS];

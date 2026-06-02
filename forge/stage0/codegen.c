@@ -85,41 +85,71 @@ static void rex(int w, int r, int x, int b) {
 
 /* ─── Known label resolution ─────────────────────────────────────── */
 static int* ir_to_offset = NULL; /* IR index → byte offset */
+static int codegen_arch = TARGET_X86_64;
+
+static void resolve_labels_arm64();
 
 static void resolve_labels() {
-    /* First pass: allocate offset array */
+    if (codegen_arch == TARGET_ARM64) {
+        resolve_labels_arm64();
+        return;
+    }
+    /* x86_64: simulate codegen to compute offsets */
     ir_to_offset = calloc(ir_n, sizeof(int));
-    
-    /* Simulate codegen to compute offsets */
     int off = 0;
     for (int i = 0; i < ir_n; i++) {
         ir_to_offset[i] = off;
         switch (ir[i].op) {
             case IR_NOP:       off += 1; break;
-            case IR_MOVI:      off += 7; break;  /* mov r/m64, imm32: REX.W + C7 /0 + 4 bytes */
-            case IR_MOV:       off += 3; break;  /* mov r64, r/m64: REX.W + 89 + modrm */
-            case IR_LEA:       off += 7; break;  /* lea r64, [rip+disp32] */
+            case IR_MOVI:      off += 7; break;
+            case IR_MOV:       off += 3; break;
+            case IR_LEA:       off += 7; break;
             case IR_ADD: case IR_SUB: case IR_AND: case IR_OR: case IR_XOR:
                                off += 3; break;
-            case IR_IMUL:      off += 4; break;  /* 48 0F AF /r */
+            case IR_IMUL:      off += 4; break;
             case IR_SHL: case IR_SHR: case IR_SAR:
                                off += 3; break;
             case IR_CMP:       off += 3; break;
-            case IR_CMPI:      off += 7; break;  /* 48 81 /7 imm32 */
-            case IR_JMP:       off += 5; break;  /* E9 rel32 */
+            case IR_CMPI:      off += 7; break;
+            case IR_JMP:       off += 5; break;
             case IR_JE: case IR_JNE: case IR_JL: case IR_JLE:
             case IR_JG: case IR_JGE: case IR_JZ: case IR_JNZ:
-                               off += 6; break;  /* 0F 8x rel32 */
-            case IR_CALL:      off += 5; break;  /* E8 rel32 */
-            case IR_RET:       off += 1; break;  /* C3 */
-            case IR_SYSCALL:   off += 2; break;  /* 0F 05 */
-            case IR_HALT:      off += 1; break;  /* F4 */
-            case IR_PUSH:      off += 1; break;  /* 50+rd */
-            case IR_POP:       off += 1; break;  /* 58+rd */
-            case IR_LABEL:     break;  /* zero bytes */
+                               off += 6; break;
+            case IR_CALL:      off += 5; break;
+            case IR_RET:       off += 1; break;
+            case IR_SYSCALL:   off += 2; break;
+            case IR_HALT:      off += 1; break;
+            case IR_PUSH:      off += 1; break;
+            case IR_POP:       off += 1; break;
+            case IR_LABEL:     break;
             case IR_DATA_BYTE: off += 1; break;
             case IR_DATA_STRING: off += (ir[i].name ? strlen(ir[i].name) : 0) + 1; break;
             case IR_MOVHI: case IR_LOAD: case IR_STORE: break;
+        }
+    }
+}
+
+static void resolve_labels_arm64() {
+    ir_to_offset = calloc(ir_n, sizeof(int));
+    int off = 0;
+    for (int i = 0; i < ir_n; i++) {
+        ir_to_offset[i] = off;
+        switch (ir[i].op) {
+            case IR_LABEL: break;
+            case IR_DATA_BYTE: off += 1; break;
+            case IR_DATA_STRING: off += (ir[i].name ? strlen(ir[i].name) : 0) + 1; break;
+            case IR_MOVI:
+                /* worst case: MOVZ + 3×MOVK = 4 instructions × 4 bytes */
+                off += 16;
+                break;
+            case IR_JMP:
+            case IR_CALL:
+                off += 4; break;  /* B/BL: 4 bytes */
+            case IR_JE: case IR_JNE: case IR_JL: case IR_JLE:
+            case IR_JG: case IR_JGE: case IR_JZ: case IR_JNZ:
+                off += 4; break;  /* B.cond: 4 bytes */
+            default:
+                off += 4; break;  /* most ARM64 insns are 4 bytes */
         }
     }
 }
@@ -280,6 +310,297 @@ static void ir_to_x86_64() {
         case IR_MOVHI: /* handled in x86_64 emit as MOVI with full 64-bit */
         case IR_LOAD: case IR_STORE: case IR_SAR: break; /* placeholder */
         case IR_LABEL: break;
+        }
+    }
+}
+
+/* ─── Translate IR to ARM64 machine code ──────────────────────────── */
+static int a64_map(int r);
+static void ir_to_arm64() {
+    resolve_labels();
+
+    code = NULL; code_len = 0; code_cap = 0;
+
+    for (int i = 0; i < ir_n; i++) {
+        IR* p = &ir[i];
+        int off = ir_to_offset[i];
+        int rd = a64_map(p->a), rn = a64_map(p->b);
+        int rd5 = rd & 0x1F, rn5 = rn & 0x1F;
+
+        switch (p->op) {
+
+        case IR_NOP:
+            e4(0xD503201F);
+            break;
+
+        case IR_MOVI: {
+            uint64_t val = (uint64_t)p->imm;
+            if (val == 0) {
+                e4(0xD2800000 | rd5);  /* MOVZ Xd, #0 */
+            } else {
+                int first = 1;
+                for (int hw = 0; hw < 4; hw++) {
+                    uint16_t chunk = (val >> (hw * 16)) & 0xFFFF;
+                    if (chunk != 0 || first) {
+                        if (first) {
+                            e4(0xD2800000 | (hw << 21) | (chunk << 5) | rd5);
+                            first = 0;
+                        } else {
+                            e4(0xF2800000 | (hw << 21) | (chunk << 5) | rd5);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        case IR_MOV:
+            /* MOV Xd, Xm = ORR Xd, XZR, Xm */
+            e4(0xAA0003E0 | (rn5 << 16) | rd5);
+            break;
+
+        case IR_LEA:
+            if (p->name) {
+                int target_idx = -1;
+                for (int j = 0; j < ir_n && target_idx < 0; j++) {
+                    if ((ir[j].op == IR_LABEL || ir[j].op == IR_DATA_STRING) &&
+                        ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_idx = j;
+                }
+                if (target_idx >= 0) {
+                    int target_off = ir_to_offset[target_idx];
+                    int disp = target_off - off;
+                    e4(0x10000000 | ((disp & 3) << 29) | (((disp >> 2) & 0x7FFFF) << 5) | rd5);
+                } else {
+                    e4(0xD503201F); /* nop placeholder */
+                }
+            } else {
+                int target = (int)p->imm;
+                int disp = target - off;
+                e4(0x10000000 | ((disp & 3) << 29) | (((disp >> 2) & 0x7FFFF) << 5) | rd5);
+            }
+            break;
+
+        case IR_ADD:
+            e4(0x8B000000 | (rn5 << 16) | (rd5 << 5) | rd5);
+            break;
+
+        case IR_SUB:
+            e4(0xCB000000 | (rn5 << 16) | (rd5 << 5) | rd5);
+            break;
+
+        case IR_AND:
+            e4(0x8A000000 | (rn5 << 16) | (rd5 << 5) | rd5);
+            break;
+
+        case IR_OR:
+            e4(0xAA000000 | (rn5 << 16) | (rd5 << 5) | rd5);
+            break;
+
+        case IR_XOR:
+            e4(0xCA000000 | (rn5 << 16) | (rd5 << 5) | rd5);
+            break;
+
+        case IR_IMUL:
+            e4(0x9B007C00 | (rn5 << 16) | (rd5 << 5) | rd5);
+            break;
+
+        case IR_CMP:
+            e4(0xEB00001F | (rn5 << 16) | (rd5 << 5));
+            break;
+
+        case IR_CMPI:
+            if (p->imm >= 0 && p->imm <= 4095) {
+                e4(0xF100001F | ((int)p->imm << 10) | (rd5 << 5));
+            } else {
+                uint64_t val = (uint64_t)p->imm;
+                int tmp = 16;
+                if (val == 0) {
+                    e4(0xD2800000 | (tmp << 5) | tmp);
+                } else {
+                    int first = 1;
+                    for (int hw = 0; hw < 4; hw++) {
+                        uint16_t chunk = (val >> (hw * 16)) & 0xFFFF;
+                        if (chunk != 0 || first) {
+                            if (first) {
+                                e4(0xD2800000 | (hw << 21) | (chunk << 5) | tmp);
+                                first = 0;
+                            } else {
+                                e4(0xF2800000 | (hw << 21) | (chunk << 5) | tmp);
+                            }
+                        }
+                    }
+                }
+                e4(0xEB00001F | (tmp << 16) | (rd5 << 5));
+            }
+            break;
+
+        case IR_JMP: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x14000000 | (rel & 0x3FFFFFF));
+            break;
+        }
+
+        case IR_CALL: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off >= 0) {
+                int rel = (target_off - off) / 4;
+                e4(0x94000000 | (rel & 0x3FFFFFF));
+            }
+            break;
+        }
+
+        case IR_JE: case IR_JZ: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x54000000 | ((rel & 0x7FFFF) << 5) | 0); /* B.EQ */
+            break;
+        }
+
+        case IR_JNE: case IR_JNZ: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x54000000 | ((rel & 0x7FFFF) << 5) | 1); /* B.NE */
+            break;
+        }
+
+        case IR_JL: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x54000000 | ((rel & 0x7FFFF) << 5) | 0xB); /* B.LT */
+            break;
+        }
+
+        case IR_JLE: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x54000000 | ((rel & 0x7FFFF) << 5) | 0xD); /* B.LE */
+            break;
+        }
+
+        case IR_JG: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x54000000 | ((rel & 0x7FFFF) << 5) | 0xC); /* B.GT */
+            break;
+        }
+
+        case IR_JGE: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off) / 4;
+            e4(0x54000000 | ((rel & 0x7FFFF) << 5) | 0xA); /* B.GE */
+            break;
+        }
+
+        case IR_RET:
+            e4(0xD65F03C0);  /* RET */
+            break;
+
+        case IR_SYSCALL:
+            e4(0xD4000001);  /* SVC #0 */
+            break;
+
+        case IR_HALT:
+            e4(0xD503201F);
+            break;
+
+        case IR_PUSH:
+            /* STR Xt, [SP, #-16]!  (pre-index, 64-bit) */
+            /* Encoding: size=11 V=0 opcode=11100 opc=10 simm9=-16 Rn=SP Rt */
+            e4(0xDC800000 | ((0x1F0 & 0x1FF) << 12) | (31 << 5) | rd5);
+            break;
+
+        case IR_POP:
+            /* LDR Xt, [SP], #16  (post-index, 64-bit) */
+            /* Encoding: size=11 V=0 opcode=11101 opc=01 simm9=16 Rn=SP Rt */
+            e4(0xDD400000 | ((16 & 0x1FF) << 12) | (31 << 5) | rd5);
+            break;
+
+        case IR_DATA_STRING:
+            if (p->name) {
+                int slen = strlen(p->name);
+                memcpy(code + code_len, p->name, slen);
+                code_len += slen;
+                e1(0);
+            }
+            break;
+
+        case IR_DATA_BYTE:
+            e1((uint8_t)p->imm);
+            break;
+
+        case IR_MOVHI:
+        case IR_LOAD:
+        case IR_STORE:
+        case IR_SHL:
+        case IR_SHR:
+        case IR_SAR:
+        case IR_LABEL:
+            break;
         }
     }
 }
@@ -546,31 +867,15 @@ static void stmt_to_ir(Node* stmt) {
                 int ci = ir_emit(IR_CALL, 0, 0, 0);
                 ir[ci].name = strdup(a1);
             } else if (strcmp(op, "lea") == 0 && n >= 2) {
-                /* lea rd, [label] — need to get address */
-                /* For bootstrap: 'lea rsi, [msg]' */
-                /* a1 = rsi, a2 = [msg] — parse the bracket */
+                /* lea rd, [label] — parse the bracket */
                 char label[64] = {0};
                 if (a2[0] == '[') {
                     sscanf(a2, "[%63[^]]]", label);
                 }
-                /* Find the data string and LEA to it */
-                int data_idx = -1;
-                for (int k = 0; k < ir_n; k++) {
-                    if (ir[k].op == IR_DATA_STRING && ir[k].name &&
-                        strcmp(ir[k].name, label) == 0) {
-                        data_idx = k;
-                        break;
-                    }
-                }
-                if (data_idx >= 0) {
-                    ir_emit(IR_LEA, reg_encode(a1), 0, ir_to_offset[data_idx]);
-                } else {
-                    /* Forward reference: emit LEA with placeholder */
-                    int li = ir_label("__asm_lea");
-                    ir[li].op = IR_LEA;
-                    ir[li].a = reg_encode(a1);
-                    ir[li].name = strdup(label);
-                }
+                /* Always use name-based forward reference. ir_to_offset is
+                   not yet available during codegen (resolve_labels runs later). */
+                int li = ir_emit(IR_LEA, reg_encode(a1), 0, 0);
+                ir[li].name = strdup(label);
             }
         }
         break;
@@ -588,9 +893,9 @@ static void stmt_to_ir(Node* stmt) {
 
 /* ─── Public API ──────────────────────────────────────────────────── */
 void codegen(Compiler* c, Node* node) {
-    (void)c;
     ir_n = 0;
     code = NULL; code_len = 0; code_cap = 0;
+    codegen_arch = c->target_arch;
 
     if (!node) return;
 
@@ -639,8 +944,12 @@ void codegen(Compiler* c, Node* node) {
     ir_emit(IR_POP, 5, 0, 0);
     ir_emit(IR_RET, 0, 0, 0);
 
-    /* Translate to x86_64 */
-    ir_to_x86_64();
+    /* Translate to target machine code */
+    if (codegen_arch == TARGET_ARM64) {
+        ir_to_arm64();
+    } else {
+        ir_to_x86_64();
+    }
     c->code = code;
     c->code_len = code_len;
 }
@@ -660,6 +969,13 @@ int reg_encode(const char* name) {
     if (strcasecmp(name, "r12") == 0) return 12; if (strcasecmp(name, "r13") == 0) return 13;
     if (strcasecmp(name, "r14") == 0) return 14; if (strcasecmp(name, "r15") == 0) return 15;
     return -1;
+}
+
+/* Map x86 virtual register numbers to ARM64 registers */
+static int a64_map(int r) {
+    if (r == 4) return 31;   /* rsp → sp */
+    if (r == 5) return 29;   /* rbp → x29 (fp) */
+    return r;                 /* x0-x15 map directly */
 }
 
 void resolve_fixups(Compiler* c) {
@@ -707,7 +1023,11 @@ void emit_catarch_binary(Compiler* c, const char* outpath, uint64_t entry_overri
     memset(hdr, 0, 128);
     hdr[0] = 0x7F; hdr[1] = 'E'; hdr[2] = 'L'; hdr[3] = 'F';
     hdr[4] = 2; hdr[5] = 1; hdr[6] = 1;
-    hdr[16] = 2; hdr[17] = 0x3E;
+    if (codegen_arch == TARGET_ARM64) {
+        hdr[16] = 2; hdr[17] = 0xB7;  /* ET_EXEC, AArch64 */
+    } else {
+        hdr[16] = 2; hdr[17] = 0x3E;  /* ET_EXEC, x86_64 */
+    }
     *(uint32_t*)(hdr + 20) = 1;
     *(uint64_t*)(hdr + 24) = 0x400000 + code_off + entry_point;
     *(uint64_t*)(hdr + 32) = 64;

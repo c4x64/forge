@@ -118,7 +118,7 @@ flowchart LR
     
     subgraph Stage1[Phase 1: Lexing]
         L[Lexer<br/>lexer.c]
-        T[Token Stream<br/>Token[65536]]
+        T["Token Stream<br/>Token[65536]"]
     end
     
     subgraph Stage2[Phase 2: Parsing]
@@ -127,7 +127,7 @@ flowchart LR
     end
     
     subgraph Stage3[Phase 3: Code Generation]
-        IR[IR Array<br/>IR[131072]]
+        IR["IR Array<br/>IR[131072]"]
         X64[x86_64 Machine Code<br/>uint8_t*]
     end
     
@@ -946,10 +946,10 @@ Labels are resolved in `resolve_labels()` at `codegen.c:89-125` and used during 
 
 ```mermaid
 sequenceDiagram
-    participant CG as codegen()
-    participant RL as resolve_labels()
-    participant TX as ir_to_x86_64()
-    participant IR as IR Array
+    participant CG as "codegen()"
+    participant RL as "resolve_labels()"
+    participant TX as "ir_to_x86_64()"
+    participant IR as "IR Array"
     
     Note over CG: Phase 1: Build IR
     CG->>IR: ir_emit(IR_LABEL, "main")
@@ -1366,10 +1366,10 @@ Forge uses a three-stage bootstrap strategy to go from C to self-hosting:
 ```mermaid
 sequenceDiagram
     participant Dev as Developer
-    participant GCC as gcc (host)
-    participant S0 as Stage 0 (C)
-    participant S1 as Stage 1 (Forge-Sub)
-    participant S2 as Stage 2 (Full Forge)
+    participant GCC as "gcc (host)"
+    participant S0 as "Stage 0 (C)"
+    participant S1 as "Stage 1 (Forge-Sub)"
+    participant S2 as "Stage 2 (Full Forge)"
     
     Note over Dev,S2: Stage 0: Bootstrapping from C
     Dev->>GCC: gcc -std=gnu99 *.c -o forge

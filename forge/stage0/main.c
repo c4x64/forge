@@ -44,8 +44,9 @@ void free_node(Node* n) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: forge <input.forge> [-o <output>] [-k] [-e <entry>] [-q]\n");
+        fprintf(stderr, "Usage: forge <input.forge> [-o <output>] [-m <arch>] [-k] [-e <entry>] [-q]\n");
         fprintf(stderr, "  -o <file>   output path (default: a.out)\n");
+        fprintf(stderr, "  -m <arch>   target architecture: x86_64 (default) or arm64\n");
         fprintf(stderr, "  -k          kernel mode: raw flat binary (no ELF wrapper)\n");
         fprintf(stderr, "  -e <addr>   set entry point address (hex)\n");
         fprintf(stderr, "  -q          quiet mode (no diagnostic output)\n");
@@ -57,11 +58,18 @@ int main(int argc, char** argv) {
     int kernel_mode = 0;
     uint64_t entry_override = 0;
     int quiet = 0;
+    int target_arch = TARGET_X86_64;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { output = argv[i+1]; i++; }
         else if (strcmp(argv[i], "-k") == 0) { kernel_mode = 1; }
         else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) { entry_override = strtoull(argv[i+1], NULL, 16); i++; }
         else if (strcmp(argv[i], "-q") == 0) { quiet = 1; }
+        else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "x86_64") == 0) target_arch = TARGET_X86_64;
+            else if (strcmp(argv[i], "arm64") == 0) target_arch = TARGET_ARM64;
+            else { fprintf(stderr, "error: unknown arch '%s' (use x86_64 or arm64)\n", argv[i]); return 1; }
+        }
     }
 
     FILE* f = fopen(input, "rb");
@@ -73,6 +81,7 @@ int main(int argc, char** argv) {
 
     Compiler comp;
     init_compiler(&comp);
+    comp.target_arch = target_arch;
     comp.src = malloc(len + 1);
     size_t rlen = fread(comp.src, 1, len, f);
     comp.src[rlen] = 0;
