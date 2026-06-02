@@ -1,0 +1,28 @@
+# Fibonacci using asm blocks and function calls
+fn fib(n: i64) -> i64:
+    asm volatile:
+        mov rax, rdi
+        cmp rax, 2
+        jl _base
+        push rbx
+        dec rax
+        mov rdi, rax
+        call fib
+        mov rbx, rax
+        mov rax, rdi
+        sub rax, 2
+        mov rdi, rax
+        call fib
+        add rax, rbx
+        pop rbx
+        ret
+        :_base
+        ret
+
+fn main() -> i64:
+    asm volatile:
+        mov rdi, 10
+        call fib
+        mov rax, 60
+        xor rdi, rdi
+        syscall

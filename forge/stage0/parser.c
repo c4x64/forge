@@ -573,7 +573,7 @@ static Node* parse_asm_block(Compiler* c) {
                         if (bi < 499) {
                             int skip = 0;
                             char cc = token_kind_to_char(c->tokens[i].kind);
-                            if (cc == '[' || cc == '(' || cc == ',') skip = 1;
+                            if (cc == '[' || cc == '(' || cc == ',' || cc == ':') skip = 1;
                             if (i + 1 < c->pos) {
                                 char nc = token_kind_to_char(c->tokens[i+1].kind);
                                 if (nc == ']' || nc == ')' || nc == ':') skip = 1;

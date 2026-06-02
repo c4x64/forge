@@ -203,26 +203,57 @@ static void ir_to_x86_64() {
             rex(1,0,0,rex_a); e1(0x81); rm(3,7,a7); e4((uint32_t)p->imm);
             break;
 
-        case IR_JMP: {
-            int target = (int)p->imm; /* IR index */
-            int dst = (target >= 0 && target < ir_n) ? ir_to_offset[target] : 0;
-            int rel = dst - (off + 5);
-            e1(0xE9); e4(rel);
+        case IR_JMP:
+        case IR_JE: case IR_JNE: case IR_JL: case IR_JLE:
+        case IR_JG: case IR_JGE: case IR_JZ: case IR_JNZ: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++) {
+                    if (ir[j].op == IR_LABEL && ir[j].name &&
+                        strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+                }
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel;
+            if (p->op == IR_JMP) {
+                rel = target_off - (off + 5);
+                e1(0xE9); e4(rel);
+            } else {
+                rel = target_off - (off + 6);
+                switch (p->op) {
+                    case IR_JE: case IR_JZ:
+                        e1(0x0F); e1(0x84); break;
+                    case IR_JNE: case IR_JNZ:
+                        e1(0x0F); e1(0x85); break;
+                    case IR_JL:  e1(0x0F); e1(0x8C); break;
+                    case IR_JLE: e1(0x0F); e1(0x8E); break;
+                    case IR_JG:  e1(0x0F); e1(0x8F); break;
+                    case IR_JGE: e1(0x0F); e1(0x8D); break;
+                    default: break;
+                }
+                e4(rel);
+            }
             break;
         }
-        case IR_JE:  { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x84); e4(t - (off+6)); break; }
-        case IR_JNE: { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x85); e4(t - (off+6)); break; }
-        case IR_JL:  { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x8C); e4(t - (off+6)); break; }
-        case IR_JLE: { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x8E); e4(t - (off+6)); break; }
-        case IR_JG:  { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x8F); e4(t - (off+6)); break; }
-        case IR_JGE: { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x8D); e4(t - (off+6)); break; }
-        case IR_JZ:  { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x84); e4(t - (off+6)); break; }
-        case IR_JNZ: { int t = ir_to_offset[(int)p->imm]; e1(0x0F); e1(0x85); e4(t - (off+6)); break; }
 
         case IR_CALL: {
-            int target = ir_to_offset[(int)p->imm];
-            int rel = target - (off + 5);
-            e1(0xE8); e4(rel);
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++) {
+                    if (ir[j].op == IR_LABEL && ir[j].name &&
+                        strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+                }
+            } else {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off >= 0) {
+                int rel = target_off - (off + 5);
+                e1(0xE8); e4(rel);
+            }
             break;
         }
         case IR_RET:     e1(0xC3); break;
@@ -319,6 +350,20 @@ static int expr_to_ir(Node* n) {
                 ir_emit(IR_MOV, 2, r3, 0);   /* rdx */
                 ir_emit(IR_MOV, 0, r0, 0);   /* rax */
                 ir_emit(IR_SYSCALL, 0, 0, 0);
+                ir_emit(IR_MOV, r, 0, 0);
+            } else {
+                /* Regular function call: args in rdi, rsi, rdx, rcx, r8, r9 */
+                int phys_regs[] = {7, 6, 2, 1, 8, 9};
+                int nargs = n->as.call.acount;
+                if (nargs > 6) nargs = 6;
+                for (int i = 0; i < nargs; i++) {
+                    int vr = expr_to_ir(n->as.call.args[i]);
+                    ir_emit(IR_MOV, phys_regs[i], vr, 0);
+                }
+                /* Emit call with function name for resolution */
+                int ci = ir_emit(IR_CALL, 0, 0, 0);
+                ir[ci].name = strdup(fname != NULL ? fname : "");
+                /* Return value from rax */
                 ir_emit(IR_MOV, r, 0, 0);
             }
         }
@@ -421,9 +466,23 @@ static void stmt_to_ir(Node* stmt) {
                     if (*end == 0) ir_emit(IR_MOVI, rd, 0, imm);
                 }
             } else if (strcmp(op, "add") == 0 && n >= 2) {
-                ir_emit(IR_ADD, reg_encode(a1), reg_encode(a2), 0);
+                int rd = reg_encode(a1), rs = reg_encode(a2);
+                if (rs >= 0) { ir_emit(IR_ADD, rd, rs, 0); }
+                else { char* e; long v = strtol(a2, &e, 0);
+                       if (*e == 0) { int t = vreg(); ir_emit(IR_MOVI, t, 0, v);
+                                      ir_emit(IR_ADD, rd, t, 0); } }
             } else if (strcmp(op, "sub") == 0 && n >= 2) {
-                ir_emit(IR_SUB, reg_encode(a1), reg_encode(a2), 0);
+                int rd = reg_encode(a1), rs = reg_encode(a2);
+                if (rs >= 0) { ir_emit(IR_SUB, rd, rs, 0); }
+                else { char* e; long v = strtol(a2, &e, 0);
+                       if (*e == 0) { int t = vreg(); ir_emit(IR_MOVI, t, 0, v);
+                                      ir_emit(IR_SUB, rd, t, 0); } }
+            } else if (strcmp(op, "cmp") == 0 && n >= 2) {
+                int rd = reg_encode(a1), rs = reg_encode(a2);
+                if (rs >= 0) { ir_emit(IR_CMP, rd, rs, 0); }
+                else { char* e; long v = strtol(a2, &e, 0);
+                       if (*e == 0) { int t = vreg(); ir_emit(IR_MOVI, t, 0, v);
+                                      ir_emit(IR_CMP, rd, t, 0); } }
             } else if (strcmp(op, "xor") == 0 && n >= 2) {
                 ir_emit(IR_XOR, reg_encode(a1), reg_encode(a2), 0);
             } else if (strcmp(op, "syscall") == 0) {
@@ -439,8 +498,12 @@ static void stmt_to_ir(Node* stmt) {
                 char* end; long v = strtol(a1, &end, 0);
                 (void)v;
             } else if (op[0] == ':') {
-                /* Label within asm block */
                 ir_label(op + 1);
+            } else if (strlen(op) > 0 && op[strlen(op)-1] == ':') {
+                int olen = strlen(op);
+                char buf[64] = {0};
+                strncpy(buf, op, olen - 1);
+                ir_label(buf);
             } else if (strcmp(op, "jmp") == 0 && n >= 2) {
                 int li = ir_label("__asm_jmp");
                 ir[li].op = IR_JMP; /* reuse as forward ref */
@@ -453,6 +516,35 @@ static void stmt_to_ir(Node* stmt) {
                 int li = ir_label("__asm_jne");
                 ir[li].op = IR_JNE;
                 ir[li].name = strdup(a1);
+            } else if (strcmp(op, "jl") == 0 && n >= 2) {
+                int li = ir_label("__asm_jl");
+                ir[li].op = IR_JL; ir[li].name = strdup(a1);
+            } else if (strcmp(op, "jle") == 0 && n >= 2) {
+                int li = ir_label("__asm_jle");
+                ir[li].op = IR_JLE; ir[li].name = strdup(a1);
+            } else if (strcmp(op, "jg") == 0 && n >= 2) {
+                int li = ir_label("__asm_jg");
+                ir[li].op = IR_JG; ir[li].name = strdup(a1);
+            } else if (strcmp(op, "jge") == 0 && n >= 2) {
+                int li = ir_label("__asm_jge");
+                ir[li].op = IR_JGE; ir[li].name = strdup(a1);
+            } else if (strcmp(op, "jz") == 0 && n >= 2) {
+                int li = ir_label("__asm_jz");
+                ir[li].op = IR_JZ; ir[li].name = strdup(a1);
+            } else if (strcmp(op, "jnz") == 0 && n >= 2) {
+                int li = ir_label("__asm_jnz");
+                ir[li].op = IR_JNZ; ir[li].name = strdup(a1);
+            } else if (strcmp(op, "dec") == 0 && n >= 2) {
+                int rd = reg_encode(a1);
+                if (rd >= 0) { int t = vreg(); ir_emit(IR_MOVI, t, 0, 1);
+                               ir_emit(IR_SUB, rd, t, 0); }
+            } else if (strcmp(op, "inc") == 0 && n >= 2) {
+                int rd = reg_encode(a1);
+                if (rd >= 0) { int t = vreg(); ir_emit(IR_MOVI, t, 0, 1);
+                               ir_emit(IR_ADD, rd, t, 0); }
+            } else if (strcmp(op, "call") == 0 && n >= 2) {
+                int ci = ir_emit(IR_CALL, 0, 0, 0);
+                ir[ci].name = strdup(a1);
             } else if (strcmp(op, "lea") == 0 && n >= 2) {
                 /* lea rd, [label] — need to get address */
                 /* For bootstrap: 'lea rsi, [msg]' */
@@ -484,6 +576,12 @@ static void stmt_to_ir(Node* stmt) {
         break;
     }
     default:
+        /* Expression used as statement */
+        if (stmt->kind == N_CALL || stmt->kind == N_BINARY ||
+            stmt->kind == N_INT || stmt->kind == N_IDENT ||
+            stmt->kind == N_STRING || stmt->kind == N_BOOL) {
+            expr_to_ir(stmt);
+        }
         break;
     }
 }
