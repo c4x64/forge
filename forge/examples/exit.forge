@@ -1,0 +1,6 @@
+fn main():
+    asm volatile:
+        mov rax, 60
+        xor rdi, rdi
+        syscall
+    return 0

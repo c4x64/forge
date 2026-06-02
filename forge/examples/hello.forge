@@ -1,0 +1,17 @@
+# Hello World in Forge
+# Stage 0: bootstrap subset (Forge-Sub)
+
+fn main() -> i64:
+    asm volatile:
+        mov rax, 1
+        mov rdi, 1
+        lea rsi, [msg]
+        mov rdx, 14
+        syscall
+        mov rax, 60
+        xor rdi, rdi
+        syscall
+    return 0
+
+:msg
+"Hello, Forge!\n"
