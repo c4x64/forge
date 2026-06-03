@@ -1256,6 +1256,41 @@ static int expr_to_ir(Node* n) {
                 int ci = ir_emit(IR_CALL, 0, 0, 0);
                 ir[ci].name = strdup(fname);
                 ir_emit(IR_MOV, r, 0, 0);
+            } else if (fname && strcmp(fname, "assert") == 0) {
+                int nargs = n->as.call.acount;
+                if (nargs >= 1) {
+                    int cond = expr_to_ir(n->as.call.args[0]);
+                    ir_emit(IR_CMPI, cond, 0, 0);
+                    int pass = ir_label("__assert_pass");
+                    ir_emit(IR_JNZ, 0, 0, pass);
+                    if (nargs >= 2 && n->as.call.args[1]->kind == N_STRING) {
+                        const char* msg = n->as.call.args[1]->as.s_val;
+                        if (msg && *msg) {
+                            int msglen = (int)strlen(msg);
+                            int msg_idx = ir_data_string(msg);
+                            int sv = vreg();
+                            ir_emit(IR_MOVI, sv, 0, sys_write[codegen_arch]);
+                            ir_emit(IR_MOV, sysno_reg[codegen_arch], sv, 0);
+                            ir_emit(IR_MOVI, sv, 0, 2);
+                            ir_emit(IR_MOV, sysarg_reg[codegen_arch][0], sv, 0);
+                            ir_emit(IR_LEA, sysarg_reg[codegen_arch][1], 0, msg_idx);
+                            ir_emit(IR_MOVI, sv, 0, msglen);
+                            ir_emit(IR_MOV, sysarg_reg[codegen_arch][2], sv, 0);
+                            ir_emit(IR_SYSCALL, 0, 0, 0);
+                        }
+                    }
+                    {
+                        int sv = vreg();
+                        ir_emit(IR_MOVI, sv, 0, sys_exit[codegen_arch]);
+                        ir_emit(IR_MOV, sysno_reg[codegen_arch], sv, 0);
+                        ir_emit(IR_MOVI, sv, 0, 1);
+                        ir_emit(IR_MOV, sysarg_reg[codegen_arch][0], sv, 0);
+                        ir_emit(IR_SYSCALL, 0, 0, 0);
+                        ir_emit(IR_HALT, 0, 0, 0);
+                    }
+                    ir[pass].op = IR_LABEL;
+                }
+                ir_emit(IR_MOVI, r, 0, 0);
             } else {
                 /* Regular function call */
                 int phys_regs[] = {7, 6, 2, 1, 8, 9};

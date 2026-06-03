@@ -1,0 +1,119 @@
+fn main() -> i64:
+    # ─── Arithmetic ──────
+    assert(1 + 1 == 2,    "1+1 == 2")
+    assert(2 * 3 == 6,    "2*3 == 6")
+    assert(10 / 2 == 5,   "10/2 == 5")
+    assert(10 - 3 == 7,   "10-3 == 7")
+    assert(7 % 3 == 1,    "7%3 == 1")
+    
+    # ─── Precedence ──────
+    assert(1 + 2 * 3 == 7,  "precedence: 1+2*3 == 7")
+    assert(10 - 3 - 2 == 5, "assoc: 10-3-2 == 5")
+    
+    # ─── Unary ───────────
+    assert(-5 < 0,  "-5 is negative")
+    assert(!!1,     "double not")
+    
+    # ─── Comparison ──────
+    assert(3 > 2,    "3 > 2")
+    assert(2 < 3,    "2 < 3")
+    assert(3 >= 3,   "3 >= 3")
+    assert(4 <= 5,   "4 <= 5")
+    assert(3 == 3,   "3 == 3")
+    assert(3 != 4,   "3 != 4")
+    
+    # ─── Boolean ─────────
+    assert(1 && 1,    "true && true")
+    assert(!(!1),     "!!true")
+    assert(1 || 0,    "true || false")
+    
+    # ─── Variables ───────
+    var x: i64 = 42
+    assert(x == 42, "var init")
+    x = 99
+    assert(x == 99, "var assign")
+    let y: i64 = x + 1
+    assert(y == 100, "let bind")
+    
+    # ─── If/Else ─────────
+    if x == 99:
+        assert(1, "if-true")
+    else:
+        assert(0, "if-false")
+    
+    if x != 99:
+        assert(0, "if-neg-false")
+    elif x == 99:
+        assert(1, "elif-true")
+    
+    if x > 200:
+        assert(0, "big")
+    elif x > 100:
+        assert(0, "med")
+    else:
+        assert(1, "else-chain")
+    
+    # ─── While ────────────
+    var i: i64 = 0
+    while i < 5:
+        i = i + 1
+    assert(i == 5, "while loop")
+    
+    # ─── For ──────────────
+    var sum: i64 = 0
+    for j in 0..3:
+        sum = sum + j
+    assert(sum == 3, "for range: 0+1+2 == 3")
+    
+    # ─── Arrays ───────────
+    var arr: [3]i64 = undefined
+    arr[0] = 10
+    arr[1] = 20
+    arr[2] = 30
+    assert(arr[0] == 10, "array[0]")
+    assert(arr[1] == 20, "array[1]")
+    assert(arr[2] == 30, "array[2]")
+    
+    # ─── Nested blocks ────
+    var outer: i64 = 0
+    if 1:
+        var inner: i64 = 0
+        while inner < 3:
+            outer = outer + 1
+            inner = inner + 1
+    assert(outer == 3, "nested blocks")
+    
+    # ─── Func call ────────
+    let d = double(21)
+    assert(d == 42, "func call: double")
+    
+    var r: i64 = 0
+    fib(10, addr_of(r))
+    assert(r == 55, "fib(10) == 55")
+    
+    # ─── Pointer arithmetic ──
+    var pb: [4]i64 = undefined
+    pb[0] = 1
+    pb[1] = 2
+    pb[2] = 3
+    pb[3] = 4
+    let pb_addr: i64 = addr_of(pb)
+    let p2: i64 = pb_addr + 8  # skip to index 1 (each i64 = 8 bytes)
+    let v2 = *cast(*i64, p2)
+    assert(v2 == 2, "ptr arith: *(addr + 8) == 2")
+    
+    write(1, "ALL TESTS PASSED\n", 17)
+    0
+
+fn double(a: i64) -> i64:
+    a * 2
+
+fn fib(n: i64, result: *i64):
+    if n <= 1:
+        *result = n
+    else:
+        var a: i64 = 0
+        var b: i64 = 0
+        fib(n - 1, addr_of(a))
+        fib(n - 2, addr_of(b))
+        *result = a + b
