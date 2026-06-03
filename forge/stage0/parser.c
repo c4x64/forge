@@ -1,5 +1,31 @@
 #include "forge.h"
 #include <stdarg.h>
+#include <string.h>
+
+/* Constant table for compile-time constant resolution */
+#define MAX_CONSTANTS 1024
+static char const_names[MAX_CONSTANTS][64];
+static int64_t const_values[MAX_CONSTANTS];
+static int nconsts = 0;
+
+static void const_add(const char* name, int64_t val) {
+    if (nconsts >= MAX_CONSTANTS) return;
+    int len = strlen(name);
+    if (len > 63) len = 63;
+    memcpy(const_names[nconsts], name, len);
+    const_names[nconsts][len] = 0;
+    const_values[nconsts] = val;
+    nconsts++;
+}
+
+static int64_t const_lookup(const char* name) {
+    for (int i = 0; i < nconsts; i++)
+        if (strcmp(const_names[i], name) == 0) return const_values[i];
+    return INT64_MAX;
+}
+
+static int64_t parse_const_expr(Compiler* c);
+static int64_t parse_const_binary(Compiler* c);
 
 void print_error(Compiler* c, const char* fmt, ...) {
     va_list args;
@@ -12,16 +38,23 @@ void print_error(Compiler* c, const char* fmt, ...) {
 }
 
 static Token peek(Compiler* c) {
-    return c->tokens[c->pos];
+    if (c->pos >= 0 && c->pos < c->ntokens)
+        return c->tokens[c->pos];
+    Token eof = { .kind = T_EOF, .line = 0, .col = 0 };
+    return eof;
 }
 
 static Token advance(Compiler* c) {
-    if (c->pos < c->ntokens) c->pos++;
-    return c->tokens[c->pos - 1];
+    if (c->pos >= 0 && c->pos < c->ntokens) c->pos++;
+    if (c->pos > 0 && c->pos <= c->ntokens)
+        return c->tokens[c->pos - 1];
+    Token eof = { .kind = T_EOF, .line = 0, .col = 0 };
+    return eof;
 }
 
 static int match(Compiler* c, TokenKind k) {
-    if (c->tokens[c->pos].kind == k) {
+    Token t = peek(c);
+    if (t.kind == k) {
         advance(c);
         return 1;
     }
@@ -29,20 +62,78 @@ static int match(Compiler* c, TokenKind k) {
 }
 
 static int expect(Compiler* c, TokenKind k, const char* msg) {
-    if (c->tokens[c->pos].kind == k) {
+    Token t = peek(c);
+    if (t.kind == k) {
         advance(c);
         return 1;
     }
-    if (!c->nerrors) print_error(c, "expected %s but got token %d", msg, c->tokens[c->pos].kind);
+    if (!c->nerrors) print_error(c, "expected %s but got token %d", msg, t.kind);
     return 0;
 }
 
 static Node* alloc_node(NodeKind kind, int line, int col) {
     Node* n = calloc(1, sizeof(Node));
+    if (!n) { fprintf(stderr, "parser error: out of memory at %d:%d\n", line, col); exit(1); }
     n->kind = kind;
     n->line = line;
     n->col = col;
     return n;
+}
+
+static int64_t parse_const_expr(Compiler* c) {
+    Token t = peek(c);
+    if (t.kind == T_INT) {
+        advance(c);
+        return t.int_val;
+    }
+    if (t.kind == T_IDENT) {
+        advance(c);
+        int64_t v = const_lookup(t.str_val);
+        if (v == INT64_MAX) { print_error(c, "unknown constant in expression"); return 1; }
+        return v;
+    }
+    if (t.kind == O_PLUS || t.kind == O_MINUS) {
+        Token unop = advance(c);
+        int64_t v = parse_const_expr(c);
+        return unop.kind == O_MINUS ? (v == INT64_MIN ? v : -v) : v;
+    }
+    if (t.kind == D_LPAREN) {
+        advance(c);
+        int64_t v = parse_const_binary(c);
+        if (peek(c).kind == D_RPAREN) advance(c);
+        return v;
+    }
+    print_error(c, "expected constant expression");
+    advance(c);
+    return 1;
+}
+
+static int64_t parse_const_term(Compiler* c) {
+    int64_t lhs = parse_const_expr(c);
+    while (peek(c).kind == O_STAR || peek(c).kind == O_SLASH) {
+        Token op = advance(c);
+        int64_t rhs = parse_const_expr(c);
+        switch (op.kind) {
+            case O_STAR:  lhs = lhs * rhs; break;
+            case O_SLASH: lhs = (rhs != 0 && !(lhs == INT64_MIN && rhs == -1)) ? lhs / rhs : 0; break;
+            default: break;
+        }
+    }
+    return lhs;
+}
+
+static int64_t parse_const_binary(Compiler* c) {
+    int64_t lhs = parse_const_term(c);
+    while (peek(c).kind == O_PLUS || peek(c).kind == O_MINUS) {
+        Token op = advance(c);
+        int64_t rhs = parse_const_term(c);
+        switch (op.kind) {
+            case O_PLUS:  lhs = lhs + rhs; break;
+            case O_MINUS: lhs = lhs - rhs; break;
+            default: break;
+        }
+    }
+    return lhs;
 }
 
 static Node* parse_type(Compiler* c);
@@ -82,11 +173,24 @@ static Node* parse_type(Compiler* c) {
         sl->as.unary.op_kind = D_LBRACK;
         return sl;
     }
-    /* Array type: [N]T */
-    if (t.kind == D_LBRACK && c->pos + 1 < c->ntokens && c->tokens[c->pos + 1].kind == T_INT) {
+    /* Pointer-to-slice type: [*]T → *([]T) */
+    if (t.kind == D_LBRACK && c->pos + 1 < c->ntokens && c->tokens[c->pos + 1].kind == O_STAR &&
+        c->pos + 2 < c->ntokens && c->tokens[c->pos + 2].kind == D_RBRACK) {
+        advance(c); advance(c); advance(c);
+        Node* elem = parse_type(c);
+        Node* sl = alloc_node(N_UNARY, line, col);
+        sl->as.unary.op = elem;
+        sl->as.unary.op_kind = D_LBRACK;
+        Node* ptr = alloc_node(N_UNARY, line, col);
+        ptr->as.unary.op = sl;
+        ptr->as.unary.op_kind = O_STAR;
+        return ptr;
+    }
+    /* Array type: [N]T — N can be any constant expression */
+    if (t.kind == D_LBRACK && c->pos + 1 < c->ntokens && c->tokens[c->pos + 1].kind != D_RBRACK) {
         advance(c);
-        int64_t count = advance(c).int_val;
-        if (count <= 0 || count > 1000000) {
+        int64_t count = parse_const_binary(c);
+        if (count <= 0 || count > 10000000) {
             print_error(c, "invalid array size");
             if (peek(c).kind == D_RBRACK) advance(c);
             free_node(parse_type(c));
@@ -143,7 +247,7 @@ static Node* parse_params(Compiler* c) {
             p->as.var.name = strdup(id.str_val);
             p->as.var.type = type;
             p->as.var.is_mut = 0;
-            n->as.block.stmts[n->as.block.count++] = p;
+            if (n->as.block.count < 64) n->as.block.stmts[n->as.block.count++] = p;
 
             if (peek(c).kind == D_COMMA) { advance(c); continue; }
             break;
@@ -212,7 +316,7 @@ static Node* parse_primary(Compiler* c) {
     if (t.kind == T_STRING) {
         advance(c);
         Node* n = alloc_node(N_STRING, line, col);
-        n->as.s_val = t.str_val ? t.str_val : strdup("");
+        n->as.s_val = t.str_val ? strdup(t.str_val) : strdup("");
         return n;
     }
     if (t.kind == K_TRUE || t.kind == K_FALSE) {
@@ -247,7 +351,8 @@ static Node* parse_primary(Compiler* c) {
         int count = 0;
         if (peek(c).kind != D_RBRACK) {
             while (1) {
-                elems[count++] = parse_expr(c);
+                Node* e = parse_expr(c);
+                if (count < 256) elems[count++] = e;
                 if (peek(c).kind == D_COMMA) advance(c);
                 else break;
             }
@@ -349,7 +454,8 @@ static Node* parse_assignment(Compiler* c) {
             call->as.call.acount = 0;
             if (peek(c).kind != D_RPAREN) {
                 while (1) {
-                    call->as.call.args[call->as.call.acount++] = parse_expr(c);
+                    Node* a = parse_expr(c);
+                    if (call->as.call.acount < 256) call->as.call.args[call->as.call.acount++] = a;
                     if (peek(c).kind == D_COMMA) advance(c);
                     else break;
                 }
@@ -397,6 +503,40 @@ static Node* parse_assignment(Compiler* c) {
 
         advance(c);
         Node* right = parse_primary(c);
+        /* Handle postfix operators on RHS (calls, indexing, fields) */
+        while (peek(c).kind == D_LPAREN || peek(c).kind == D_LBRACK || peek(c).kind == D_DOT) {
+            if (peek(c).kind == D_LPAREN) {
+                advance(c);
+                Node* call = alloc_node(N_CALL, right->line, right->col);
+                call->as.call.callee = right;
+                call->as.call.args = calloc(256, sizeof(Node*));
+                call->as.call.acount = 0;
+                if (peek(c).kind != D_RPAREN) {
+                    while (1) {
+                        Node* a = parse_expr(c);
+                        if (call->as.call.acount < 256) call->as.call.args[call->as.call.acount++] = a;
+                        if (peek(c).kind == D_COMMA) advance(c);
+                        else break;
+                    }
+                }
+                expect(c, D_RPAREN, "')'");
+                right = call;
+            } else if (peek(c).kind == D_LBRACK) {
+                advance(c);
+                Node* idx = alloc_node(N_INDEX, right->line, right->col);
+                idx->as.index_.obj = right;
+                idx->as.index_.idx = parse_expr(c);
+                expect(c, D_RBRACK, "']'");
+                right = idx;
+            } else if (peek(c).kind == D_DOT) {
+                advance(c);
+                Node* f = alloc_node(N_FIELD, right->line, right->col);
+                f->as.field.obj = right;
+                Token name = advance(c);
+                f->as.field.field = name.kind == T_IDENT ? strdup(name.str_val) : strdup("");
+                right = f;
+            }
+        }
 
         /* Handle chained ops with higher precedence */
         while (1) {
@@ -404,9 +544,44 @@ static Node* parse_assignment(Compiler* c) {
             Precedence nxt_prec = op_prec(nxt.kind);
             if (nxt_prec > prec && nxt_prec != PREC_ASSIGN) {
                 advance(c);
-                Node* n = alloc_node(N_BINARY, right->line, right->col);
+                Node* rhs = parse_primary(c);
+                /* Also handle postfix on the higher-precedence RHS */
+                while (peek(c).kind == D_LPAREN || peek(c).kind == D_LBRACK || peek(c).kind == D_DOT) {
+                    if (peek(c).kind == D_LPAREN) {
+                        advance(c);
+                        Node* call = alloc_node(N_CALL, rhs->line, rhs->col);
+                        call->as.call.callee = rhs;
+                        call->as.call.args = calloc(256, sizeof(Node*));
+                        call->as.call.acount = 0;
+                        if (peek(c).kind != D_RPAREN) {
+                            while (1) {
+                                Node* a = parse_expr(c);
+                                if (call->as.call.acount < 256) call->as.call.args[call->as.call.acount++] = a;
+                                if (peek(c).kind == D_COMMA) advance(c);
+                                else break;
+                            }
+                        }
+                        expect(c, D_RPAREN, "')'");
+                        rhs = call;
+                    } else if (peek(c).kind == D_LBRACK) {
+                        advance(c);
+                        Node* idx = alloc_node(N_INDEX, rhs->line, rhs->col);
+                        idx->as.index_.obj = rhs;
+                        idx->as.index_.idx = parse_expr(c);
+                        expect(c, D_RBRACK, "']'");
+                        rhs = idx;
+                    } else if (peek(c).kind == D_DOT) {
+                        advance(c);
+                        Node* f = alloc_node(N_FIELD, rhs->line, rhs->col);
+                        f->as.field.obj = rhs;
+                        Token name = advance(c);
+                        f->as.field.field = name.kind == T_IDENT ? strdup(name.str_val) : strdup("");
+                        rhs = f;
+                    }
+                }
+                Node* n = alloc_node(N_BINARY, rhs->line, rhs->col);
                 n->as.binary.l = right;
-                n->as.binary.r = parse_primary(c);
+                n->as.binary.r = rhs;
                 n->as.binary.op = nxt.kind;
                 right = n;
             } else break;
@@ -432,6 +607,8 @@ static Node* parse_block(Compiler* c) {
     /* Support both `if cond: stmt` (single-line) and `if cond:\n    stmt` (block) */
     if (peek(c).kind == T_NEWLINE) {
         advance(c);
+        /* Skip blank lines (multiple newlines before indented body) */
+        while (peek(c).kind == T_NEWLINE) advance(c);
         expect(c, T_INDENT, "indented block");
         while (c->pos < c->ntokens) {
             Token t = peek(c);
@@ -439,13 +616,18 @@ static Node* parse_block(Compiler* c) {
             if (t.kind == T_EOF) break;
             if (t.kind == T_NEWLINE) { advance(c); continue; }
             Node* stmt = parse_stmt(c);
-            if (stmt) block->as.block.stmts[block->as.block.count++] = stmt;
+            if (stmt && block->as.block.count < 4096) block->as.block.stmts[block->as.block.count++] = stmt;
         }
         expect(c, T_DEDENT, "dedent (end of block)");
     } else {
-        /* Single-line: parse one statement */
-        Node* stmt = parse_stmt(c);
-        if (stmt) block->as.block.stmts[block->as.block.count++] = stmt;
+        /* Single-line: parse one or more statements separated by ; */
+        while (1) {
+            if (peek(c).kind == T_NEWLINE || peek(c).kind == T_DEDENT || peek(c).kind == T_EOF) break;
+            Node* stmt = parse_stmt(c);
+            if (stmt && block->as.block.count < 4096) block->as.block.stmts[block->as.block.count++] = stmt;
+            if (peek(c).kind == D_SEMI) advance(c);
+            else break;
+        }
     }
     return block;
 }
@@ -480,7 +662,7 @@ static Node* parse_struct_decl(Compiler* c) {
         Node* fnode = alloc_node(N_LET, fn.line, fn.col);
         fnode->as.var.name = strdup(fn.str_val);
         fnode->as.var.type = ft;
-        n->as.struct_decl.fields[n->as.struct_decl.fcount++] = fnode;
+        if (n->as.struct_decl.fcount < 256) n->as.struct_decl.fields[n->as.struct_decl.fcount++] = fnode;
         match(c, T_NEWLINE);
     }
 
@@ -619,7 +801,7 @@ static Node* parse_asm_block(Compiler* c) {
                     line_buf[bi] = 0;
                     while (bi > 0 && line_buf[bi-1] == ' ') bi--;
                     line_buf[bi] = 0;
-                    if (bi > 0) {
+                    if (bi > 0 && n->as.asm_block.count < 4096) {
                         n->as.asm_block.lines[n->as.asm_block.count++] = strdup(line_buf);
                     }
                 }
@@ -684,6 +866,11 @@ static Node* parse_stmt(Compiler* c) {
         if (peek(c).kind == O_ASSIGN) {
             advance(c);
             n->as.var.init = parse_expr(c);
+            /* Register integer constants for compile-time resolution */
+            if ((t.kind == K_LET || t.kind == K_CONST) &&
+                n->as.var.init && n->as.var.init->kind == N_INT) {
+                const_add(name.str_val, n->as.var.init->as.i_val);
+            }
         }
 
         match(c, T_NEWLINE);
@@ -750,13 +937,25 @@ static Node* parse_stmt(Compiler* c) {
         Node* n = alloc_node(N_IF, line, col);
         n->as.flow.cond = parse_expr(c);
         n->as.flow.body = parse_block(c);
-        n->as.flow.else_body = NULL;
-        if (peek(c).kind == K_ELSE) {
-            advance(c);
-            if (peek(c).kind == K_IF) {
-                n->as.flow.else_body = parse_stmt(c);
+        /* Handle elif/else chain */
+        Node* cur = n;
+        while (peek(c).kind == K_ELSE || peek(c).kind == K_ELIF) {
+            if (peek(c).kind == K_ELIF) {
+                advance(c);
+                Node* elif = alloc_node(N_IF, line, col);
+                elif->as.flow.cond = parse_expr(c);
+                elif->as.flow.body = parse_block(c);
+                elif->as.flow.else_body = NULL;
+                cur->as.flow.else_body = elif;
+                cur = elif;
             } else {
-                n->as.flow.else_body = parse_block(c);
+                advance(c);
+                if (peek(c).kind == K_IF) {
+                    cur->as.flow.else_body = parse_stmt(c);
+                } else {
+                    cur->as.flow.else_body = parse_block(c);
+                }
+                break;
             }
         }
         return n;
@@ -802,7 +1001,7 @@ Node* parse_program(Compiler* c) {
         if (t.kind == T_NEWLINE) { advance(c); continue; }
         if (t.kind == T_DEDENT) { advance(c); continue; }
         Node* stmt = parse_stmt(c);
-        if (stmt) prog->as.program.stmts[prog->as.program.count++] = stmt;
+        if (stmt && prog->as.program.count < 4096) prog->as.program.stmts[prog->as.program.count++] = stmt;
     }
 
     return prog;

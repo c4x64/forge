@@ -18,7 +18,7 @@
 typedef enum {
     T_EOF, T_NEWLINE, T_INDENT, T_DEDENT,
     T_IDENT, T_INT, T_HEX, T_BIN, T_FLOAT, T_STRING,
-    K_FN, K_LET, K_VAR, K_STRUCT, K_IF, K_ELSE, K_WHILE, K_FOR,
+    K_FN, K_LET, K_VAR, K_STRUCT, K_IF, K_ELSE, K_ELIF, K_WHILE, K_FOR,
     K_RETURN, K_ASM, K_VOLATILE, K_SAFETY, K_PURE, K_HARDWARE,
     K_BOUNDED, K_UNBOUNDED, K_TYPESTATE, K_TRUE, K_FALSE,
     K_IN, K_BREAK, K_CONTINUE, K_IMPORT, K_CAST, K_LAYOUT, K_PACKED,
@@ -93,6 +93,7 @@ typedef struct Node {
 /* ─── Target architectures ────────────────────────────────────────── */
 #define TARGET_X86_64 0
 #define TARGET_ARM64  1
+#define TARGET_ARM32  2
 
 /* ─── Compiler context ────────────────────────────────────────────── */
 typedef struct {
@@ -102,6 +103,7 @@ typedef struct {
     int       ntokens;
     int       pos;
     int       target_arch; /* TARGET_X86_64 or TARGET_ARM64 */
+    int       shared;      /* 1 = produce ET_DYN shared object */
     char      filename[256];
     char      labels[MAX_LABELS][64];
     int       label_addrs[MAX_LABELS];

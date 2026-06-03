@@ -32,7 +32,7 @@ static Token make_str(char* s, int line, int col) {
 static int word_to_keyword(const char* s, int len) {
     #define KW(s_, k_) if (strncmp(s, s_, len) == 0 && strlen(s_) == len) return k_
     KW("fn", K_FN); KW("let", K_LET); KW("var", K_VAR);
-    KW("struct", K_STRUCT); KW("if", K_IF); KW("else", K_ELSE);
+    KW("struct", K_STRUCT); KW("if", K_IF); KW("else", K_ELSE); KW("elif", K_ELIF);
     KW("while", K_WHILE); KW("for", K_FOR); KW("return", K_RETURN);
     KW("asm", K_ASM); KW("volatile", K_VOLATILE);
     KW("safety", K_SAFETY); KW("pure", K_PURE); KW("hardware", K_HARDWARE);
@@ -44,6 +44,7 @@ static int word_to_keyword(const char* s, int len) {
     KW("sizeof", K_SIZE_OF); KW("addr_of", K_ADDR_OF);
     KW("undefined", K_UNDEFINED); KW("const", K_CONST);
     KW("pub", K_PUB);
+    KW("and", O_AND_AND); KW("or", O_OR_OR); KW("not", O_BANG);
     /* Types */
     KW("u8", T_U8); KW("u16", T_U16); KW("u32", T_U32); KW("u64", T_U64);
     KW("i8", T_I8); KW("i16", T_I16); KW("i32", T_I32); KW("i64", T_I64);
@@ -84,11 +85,16 @@ void lex(Compiler* c) {
             if (ch != '\n' && ch != '#') {
                 /* Handle indent/dedent */
                 if (level > indent_stack[indent_top]) {
-                    if (nt < MAX_TOKENS) {
-                        Token t = make_token( T_INDENT, line, 1);
-                        c->tokens[nt++] = t;
+                    if (indent_top >= 255) {
+                        fprintf(stderr, "lex error: indentation too deep at line %d\n", line);
+                        indent_top = 255;
+                    } else {
+                        if (nt < MAX_TOKENS) {
+                            Token t = make_token( T_INDENT, line, 1);
+                            c->tokens[nt++] = t;
+                        }
+                        indent_stack[++indent_top] = level;
                     }
-                    indent_stack[++indent_top] = level;
                 } else {
                     while (indent_top > 0 && level < indent_stack[indent_top]) {
                         if (nt < MAX_TOKENS) {
@@ -177,7 +183,11 @@ void lex(Compiler* c) {
                 c->pos++; col++;
             }
             int end = c->pos;
-            if (c->pos < (int)c->src_len) { c->pos++; col++; } /* skip closing */
+            if (c->pos >= (int)c->src_len) {
+                fprintf(stderr, "lex error: unterminated string at line %d\n", save_line);
+            } else {
+                c->pos++; col++; /* skip closing " */
+            }
             /* Properly handle escape sequences */
             char* buf = calloc(end - start + 1, 1);
             int bi = 0;
@@ -271,7 +281,11 @@ void lex(Compiler* c) {
             }
             int len = c->pos - start;
             char buf[128];
-            if (len < 128) {
+            if (len >= 128) {
+                fprintf(stderr, "lex error: identifier too long at line %d\n", save_line);
+                len = 0;
+                buf[0] = 0;
+            } else {
                 memcpy(buf, c->src + start, len);
                 buf[len] = 0;
             }

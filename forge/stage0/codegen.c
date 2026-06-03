@@ -63,7 +63,9 @@ static int code_len = 0, code_cap = 0;
 static void e1(uint8_t v) {
     if (code_len >= code_cap) {
         code_cap = code_cap ? code_cap * 2 : 262144;
-        code = realloc(code, code_cap);
+        uint8_t* new_code = realloc(code, code_cap);
+        if (!new_code) { fprintf(stderr, "codegen error: out of memory\n"); return; }
+        code = new_code;
     }
     code[code_len++] = v;
 }
@@ -141,10 +143,15 @@ static void collect_locals(Node* node) {
 }
 
 static void resolve_labels_arm64();
+static void resolve_labels_arm32();
 
 static void resolve_labels() {
     if (codegen_arch == TARGET_ARM64) {
         resolve_labels_arm64();
+        return;
+    }
+    if (codegen_arch == TARGET_ARM32) {
+        resolve_labels_arm32();
         return;
     }
     /* x86_64: simulate codegen to compute offsets */
@@ -203,8 +210,30 @@ static void resolve_labels_arm64() {
             case IR_JG: case IR_JGE: case IR_JZ: case IR_JNZ:
                 off += 4; break;  /* B.cond: 4 bytes */
             case IR_LOAD: case IR_STORE: off += 4; break;
+            case IR_MOVHI: off += 4; break;
+            case IR_SHL: case IR_SHR: case IR_SAR: off += 4; break;
+            case IR_PUSH: case IR_POP: off += 4; break;
             default:
                 off += 4; break;  /* most ARM64 insns are 4 bytes */
+        }
+    }
+}
+
+static void resolve_labels_arm32() {
+    ir_to_offset = calloc(ir_n, sizeof(int));
+    int off = 0;
+    for (int i = 0; i < ir_n; i++) {
+        ir_to_offset[i] = off;
+        switch (ir[i].op) {
+            case IR_LABEL: break;
+            case IR_DATA_BYTE: off += 1; break;
+            case IR_DATA_STRING: off += (ir[i].name ? strlen(ir[i].name) : 0) + 1; break;
+            case IR_MOVI:
+                /* MOVW + optional MOVT = 4 or 8 bytes */
+                off += ((uint64_t)ir[i].imm >> 16) ? 8 : 4;
+                break;
+            default:
+                off += 4; break;  /* all ARM32 insns are 4 bytes */
         }
     }
 }
@@ -387,6 +416,7 @@ static void ir_to_x86_64() {
 
 /* ─── Translate IR to ARM64 machine code ──────────────────────────── */
 static int a64_map(int r);
+static int arm32_map(int r);
 static void ir_to_arm64() {
     resolve_labels();
 
@@ -684,14 +714,439 @@ static void ir_to_arm64() {
             }
             break;
 
-        case IR_MOVHI:
-        case IR_SHL:
-        case IR_SHR:
-        case IR_SAR:
+        case IR_MOVHI: {
+            /* MOVK Xd, #imm16, LSL #hw (set upper 16-bit half) */
+            /* p->a = dest, p->imm = 16-bit value, p->b = hw (0-3) */
+            uint64_t val = (uint64_t)p->imm;
+            int hw = p->b & 3;
+            uint16_t chunk = (val >> (hw * 16)) & 0xFFFF;
+            e4(0xF2800000 | (hw << 21) | (chunk << 5) | rd5);
+            break;
+        }
+
+        case IR_SHL: {
+            /* LSL Xd, Xn, #shift = UBFM Xd, Xn, #((64-s)&63), #(63-s) */
+            int s = (int)p->imm & 0x3F;
+            int immr = (64 - s) & 0x3F;
+            int imms = (63 - s) & 0x3F;
+            e4(0xD3400000 | (immr << 16) | (imms << 10) | (rn5 << 5) | rd5);
+            break;
+        }
+
+        case IR_SHR: {
+            /* LSR Xd, Xn, #shift = UBFM Xd, Xn, #s, #63 */
+            int s = (int)p->imm & 0x3F;
+            e4(0xD3400000 | (s << 16) | (63 << 10) | (rn5 << 5) | rd5);
+            break;
+        }
+
+        case IR_SAR: {
+            /* ASR Xd, Xn, #shift = SBFM Xd, Xn, #s, #63 */
+            int s = (int)p->imm & 0x3F;
+            e4(0x93400000 | (s << 16) | (63 << 10) | (rn5 << 5) | rd5);
+            break;
+        }
+
         case IR_LABEL:
             break;
         }
     }
+}
+
+/* ─── Translate IR to ARM32 machine code ──────────────────────────── */
+static void arm32_emit_mov_imm(int rd, uint32_t val) {
+    if ((val & ~0xFF) == 0) {
+        e4(0xE3A00000 | (rd << 12) | val);
+    } else {
+        e4(0xE3000000 | (rd << 12) | ((val & 0xF000) << 4) | (val & 0xFFF));
+        if ((val >> 16) != 0) {
+            uint32_t hi = (val >> 16) & 0xFFFF;
+            e4(0xE3400000 | (rd << 12) | ((hi & 0xF000) << 4) | (hi & 0xFFF));
+        }
+    }
+}
+
+static void ir_to_arm32() {
+    resolve_labels();
+    code = NULL; code_len = 0; code_cap = 0;
+    int skip_next = 0;
+
+    for (int i = 0; i < ir_n; i++) {
+        if (skip_next) { skip_next = 0; continue; }
+        IR* p = &ir[i];
+        int off = ir_to_offset[i];
+        int ra = arm32_map(p->a), rb = arm32_map(p->b);
+        int ra4 = ra & 0xF, rb4 = rb & 0xF;
+
+        switch (p->op) {
+
+        case IR_NOP:
+            e4(0xE1A00000);  /* MOV R0, R0 */
+            break;
+
+        case IR_MOVI:
+            arm32_emit_mov_imm(ra, (uint32_t)p->imm);
+            break;
+
+        case IR_MOV:
+            /* MOV Rd, Rm */
+            e4(0xE1A00000 | (ra4 << 12) | rb4);
+            break;
+
+        case IR_MOVHI:
+            /* MOVK Rd, #imm16, LSL #hw (set upper 16-bit half) */
+            {
+                uint32_t val = (uint32_t)p->imm;
+                int hw = p->b & 3;
+                uint16_t chunk = (val >> (hw * 16)) & 0xFFFF;
+                e4(0xE3400000 | (ra4 << 12) | ((chunk & 0xF000) << 4) | (chunk & 0xFFF));
+            }
+            break;
+
+        case IR_LEA:
+            /* ADR Rd, label — compute PC-relative address */
+            if (p->name) {
+                int target_idx = -1;
+                for (int j = 0; j < ir_n && target_idx < 0; j++) {
+                    if ((ir[j].op == IR_LABEL || ir[j].op == IR_DATA_STRING) &&
+                        ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_idx = j;
+                }
+                if (target_idx >= 0) {
+                    int target_off = ir_to_offset[target_idx];
+                    int disp = target_off - (off + 8);
+                    if (disp >= 0 && disp <= 4095) {
+                        e4(0xE28F0000 | (ra4 << 12) | disp);
+                    } else if (disp < 0 && -disp <= 4095) {
+                        e4(0xE24F0000 | (ra4 << 12) | (-disp));
+                    } else {
+                        /* fallback: load into temp, add to PC */
+                        arm32_emit_mov_imm(12, (uint32_t)(disp < 0 ? -disp : disp));
+                        if (disp >= 0)
+                            e4(0xE08F000C | (ra4 << 12) | 12);  /* ADD Rd, PC, R12 */
+                        else
+                            e4(0xE04F000C | (ra4 << 12) | 12);  /* SUB Rd, PC, R12 */
+                    }
+                } else {
+                    e4(0xE1A00000); /* nop */
+                }
+            } else {
+                int target = (int)p->imm;
+                int disp = target - (off + 8);
+                if (disp >= 0 && disp <= 4095) {
+                    e4(0xE28F0000 | (ra4 << 12) | disp);
+                } else if (disp < 0 && -disp <= 4095) {
+                    e4(0xE24F0000 | (ra4 << 12) | (-disp));
+                } else {
+                    arm32_emit_mov_imm(12, disp < 0 ? -disp : disp);
+                    if (disp >= 0)
+                        e4(0xE08F000C | (ra4 << 12) | 12);
+                    else
+                        e4(0xE04F000C | (ra4 << 12) | 12);
+                }
+            }
+            break;
+
+        case IR_ADD:
+            /* ADD Rd, Rn, Rm  — rd += rm */
+            e4(0xE0800000 | (ra4 << 16) | (ra4 << 12) | rb4);
+            break;
+
+        case IR_SUB:
+            /* SUB Rd, Rn, Rm  — rd -= rm */
+            e4(0xE0400000 | (ra4 << 16) | (ra4 << 12) | rb4);
+            break;
+
+        case IR_AND:
+            /* AND Rd, Rn, Rm  — rd &= rm */
+            e4(0xE0000000 | (ra4 << 16) | (ra4 << 12) | rb4);
+            break;
+
+        case IR_OR:
+            /* ORR Rd, Rn, Rm  — rd |= rm */
+            e4(0xE1800000 | (ra4 << 16) | (ra4 << 12) | rb4);
+            break;
+
+        case IR_XOR:
+            /* EOR Rd, Rn, Rm  — rd ^= rm */
+            e4(0xE0200000 | (ra4 << 16) | (ra4 << 12) | rb4);
+            break;
+
+        case IR_IMUL:
+            /* MUL Rd, Rm, Rs  — rd = rd * rs */
+            e4(0xE0000090 | (ra4 << 16) | (rb4 << 8) | ra4);
+            break;
+
+        case IR_SHL:
+            /* LSL: MOV Rd, Rd, LSL #s */
+            e4(0xE1A00000 | (ra4 << 12) | (((int)p->imm & 0x1F) << 7) | ra4);
+            break;
+
+        case IR_SHR:
+            /* LSR: MOV Rd, Rd, LSR #s */
+            e4(0xE1A00020 | (ra4 << 12) | (((int)p->imm & 0x1F) << 7) | ra4);
+            break;
+
+        case IR_SAR:
+            /* ASR: MOV Rd, Rd, ASR #s */
+            e4(0xE1A00040 | (ra4 << 12) | (((int)p->imm & 0x1F) << 7) | ra4);
+            break;
+
+        case IR_CMP:
+            /* CMP Rn, Rm */
+            e4(0xE1500000 | (ra4 << 16) | rb4);
+            break;
+
+        case IR_CMPI:
+            /* CMP Rn, #imm — load into R12(IP) first */
+            arm32_emit_mov_imm(12, (uint32_t)p->imm);
+            e4(0xE1500000 | (ra4 << 16) | 12);
+            break;
+
+        case IR_JMP: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0xEA000000 | (rel & 0xFFFFFF));
+            break;
+        }
+
+        case IR_CALL: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off >= 0) {
+                int rel = (target_off - off - 8) / 4;
+                e4(0xEB000000 | (rel & 0xFFFFFF));
+            }
+            break;
+        }
+
+        case IR_JE: case IR_JZ: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0x0A000000 | (rel & 0xFFFFFF));  /* B.EQ */
+            break;
+        }
+
+        case IR_JNE: case IR_JNZ: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0x1A000000 | (rel & 0xFFFFFF));  /* B.NE */
+            break;
+        }
+
+        case IR_JL: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0xBA000000 | (rel & 0xFFFFFF));  /* B.LT */
+            break;
+        }
+
+        case IR_JLE: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0xDA000000 | (rel & 0xFFFFFF));  /* B.LE */
+            break;
+        }
+
+        case IR_JG: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0xCA000000 | (rel & 0xFFFFFF));  /* B.GT */
+            break;
+        }
+
+        case IR_JGE: {
+            int target_off = -1;
+            if (p->name) {
+                for (int j = 0; j < ir_n && target_off < 0; j++)
+                    if (ir[j].op == IR_LABEL && ir[j].name && strcmp(ir[j].name, p->name) == 0)
+                        target_off = ir_to_offset[j];
+            } else if (p->imm >= 0 && p->imm < ir_n) {
+                target_off = ir_to_offset[(int)p->imm];
+            }
+            if (target_off < 0) target_off = off;
+            int rel = (target_off - off - 8) / 4;
+            e4(0xAA000000 | (rel & 0xFFFFFF));  /* B.GE */
+            break;
+        }
+
+        case IR_RET:
+            /* BX LR — return via link register */
+            e4(0xE12FFF1E);
+            break;
+
+        case IR_SYSCALL:
+            /* SVC #0 — ARM Linux syscall, expects sysno in R7 */
+            e4(0xEF000000);
+            break;
+
+        case IR_HALT:
+            e4(0xE1A00000);  /* infinite loop: B . */
+            e4(0xEAFFFFFE);
+            break;
+
+        case IR_PUSH:
+            if (ra4 == 11) {
+                /* PUSH {R11, LR} */
+                e4(0xE92D4C00);
+            } else {
+                e4(0xE92D0000 | (1 << ra4));
+            }
+            break;
+
+        case IR_POP:
+            if (ra4 == 11 && i + 1 < ir_n && ir[i+1].op == IR_RET) {
+                /* POP {R11, PC} — return sequence */
+                e4(0xE8BD8800);
+                skip_next = 1;
+            } else {
+                e4(0xE8BD0000 | (1 << ra4));
+            }
+            break;
+
+        case IR_DATA_STRING:
+            if (p->name) {
+                int slen = strlen(p->name);
+                memcpy(code + code_len, p->name, slen);
+                code_len += slen;
+                e1(0);
+            }
+            break;
+
+        case IR_DATA_BYTE:
+            e1((uint8_t)p->imm);
+            break;
+
+        case IR_STORE:
+            /* STR Rt, [Rn, #imm12] */
+            if (p->imm >= 0 && p->imm <= 4095) {
+                e4(0xE5800000 | (ra4 << 16) | (rb4 << 12) | ((int)p->imm & 0xFFF));
+            } else if (p->imm < 0 && -p->imm <= 4095) {
+                e4(0xE5000000 | (ra4 << 16) | (rb4 << 12) | ((-(int)p->imm) & 0xFFF));
+            } else {
+                /* large or negative offset: add to R12, then STR with reg offset */
+                arm32_emit_mov_imm(12, (uint32_t)(int)p->imm);
+                e4(0xE780000B | (ra4 << 16) | (rb4 << 12));  /* STR Rb, [Ra, R12] */
+            }
+            break;
+
+        case IR_LOAD:
+            /* LDR Rt, [Rn, #imm12] */
+            if (p->imm >= 0 && p->imm <= 4095) {
+                e4(0xE5900000 | (rb4 << 16) | (ra4 << 12) | ((int)p->imm & 0xFFF));
+            } else if (p->imm < 0 && -p->imm <= 4095) {
+                e4(0xE5100000 | (rb4 << 16) | (ra4 << 12) | ((-(int)p->imm) & 0xFFF));
+            } else {
+                arm32_emit_mov_imm(12, (uint32_t)(int)p->imm);
+                e4(0xE790000B | (rb4 << 16) | (ra4 << 12));  /* LDR Ra, [Rb, R12] */
+            }
+            break;
+
+        case IR_LABEL:
+            break;
+        }
+    }
+}
+
+static int expr_to_ir(Node* n);  /* forward decl for emit_syscall */
+
+/* ─── Syscall number tables ─────────────────────────────────────── */
+static const long sys_exit[]   = {60, 93, 1};
+static const long sys_read[]   = {0, 63, 3};
+static const long sys_write[]  = {1, 64, 4};
+static const long sys_open[]   = {2, 56, 5};
+static const long sys_close[]  = {3, 57, 6};
+static const long sys_mmap[]   = {9, 222, 192};
+static const long sys_munmap[] = {11, 215, 91};
+static const long sys_mprotect[] = {10, 226, 125};
+static const long sys_brk[]    = {12, 214, 45};
+
+/* Syscall number register per arch: [x86_64, arm64, arm32] */
+static const int sysno_reg[3] = {0, 8, 7};
+/* Argument registers per arch (up to 6 args): rax/rdi/rsi/rdx/r10/r8/r9 */
+static const int sysarg_reg[3][6] = {
+    {7, 6, 2, 10, 8, 9},   /* x86_64: rdi, rsi, rdx, r10, r8, r9 */
+    {0, 1, 2, 3, 4, 5},    /* arm64:  x0, x1, x2, x3, x4, x5 */
+    {0, 1, 2, 3, 4, 5},    /* arm32:  r0, r1, r2, r3, r4, r5 */
+};
+
+/* Emit a full syscall: sets up registers and emits SYSCALL */
+static int emit_syscall(int sysno, Node** args, int nargs) {
+    int sysno_regno = sysno_reg[codegen_arch];
+    int r_sysno;
+    if (sysno >= 0) {
+        r_sysno = vreg();
+        ir_emit(IR_MOVI, r_sysno, 0, sysno);
+    } else {
+        /* syscall number is an expression (from __syscall built-in) */
+        r_sysno = expr_to_ir(args[0]);
+        args++; nargs--;
+    }
+    int nr = nargs > 6 ? 6 : nargs;
+    for (int i = 0; i < nr; i++) {
+        int vr = expr_to_ir(args[i]);
+        int pr = sysarg_reg[codegen_arch][i];
+        ir_emit(IR_MOV, pr, vr, 0);
+    }
+    ir_emit(IR_MOV, sysno_regno, r_sysno, 0);
+    ir_emit(IR_SYSCALL, 0, 0, 0);
+    int r = vreg();
+    ir_emit(IR_MOV, r, 0, 0);
+    return r;
 }
 
 /* ─── Expression → IR ────────────────────────────────────────────── */
@@ -758,19 +1213,39 @@ static int expr_to_ir(Node* n) {
     case N_CALL:
         if (n->as.call.callee->kind == N_IDENT) {
             const char* fname = n->as.call.callee->as.s_val;
-            if (strcmp(fname, "__syscall") == 0 && n->as.call.acount >= 4) {
-                int r0 = expr_to_ir(n->as.call.args[0]); /* syscall no */
-                int r1 = expr_to_ir(n->as.call.args[1]); /* rdi */
-                int r2_ = expr_to_ir(n->as.call.args[2]); /* rsi */
-                int r3 = expr_to_ir(n->as.call.args[3]); /* rdx */
-                ir_emit(IR_MOV, 7, r1, 0);   /* rdi */
-                ir_emit(IR_MOV, 6, r2_, 0);  /* rsi */
-                ir_emit(IR_MOV, 2, r3, 0);   /* rdx */
-                ir_emit(IR_MOV, 0, r0, 0);   /* rax */
-                ir_emit(IR_SYSCALL, 0, 0, 0);
-                ir_emit(IR_MOV, r, 0, 0);
-            } else {
-                /* Regular function call: args in rdi, rsi, rdx, rcx, r8, r9 */
+
+            /* ─── Built-in syscall wrappers ─────────────────────────── */
+            struct { const char* name; const long* sysno; int min_args; } bwrap[] = {
+                {"exit",     sys_exit,   1},
+                {"read",     sys_read,   3},
+                {"write",    sys_write,  3},
+                {"open",     sys_open,   2},
+                {"close",    sys_close,  1},
+                {"mmap",     sys_mmap,   6},
+                {"munmap",   sys_munmap, 2},
+                {"mprotect", sys_mprotect, 3},
+                {"brk",      sys_brk,    1},
+                {NULL, NULL, 0}
+            };
+            int bwrap_match = 0;
+            if (fname) {
+                for (int bi = 0; bwrap[bi].name; bi++) {
+                    if (strcmp(fname, bwrap[bi].name) == 0) {
+                        r = emit_syscall((int)bwrap[bi].sysno[codegen_arch],
+                                         n->as.call.args, n->as.call.acount);
+                        bwrap_match = 1;
+                        break;
+                    }
+                }
+            }
+            if (bwrap_match) {
+                /* done — r already set by emit_syscall */
+            } else if (fname && strcmp(fname, "__syscall") == 0) {
+                r = emit_syscall(-1, n->as.call.args, n->as.call.acount);
+            } else if (fname && (strcmp(fname, "dlopen") == 0 ||
+                                 strcmp(fname, "dlsym") == 0 ||
+                                 strcmp(fname, "dlclose") == 0)) {
+                /* Dynamic linker functions — emit regular call */
                 int phys_regs[] = {7, 6, 2, 1, 8, 9};
                 int nargs = n->as.call.acount;
                 if (nargs > 6) nargs = 6;
@@ -778,10 +1253,20 @@ static int expr_to_ir(Node* n) {
                     int vr = expr_to_ir(n->as.call.args[i]);
                     ir_emit(IR_MOV, phys_regs[i], vr, 0);
                 }
-                /* Emit call with function name for resolution */
                 int ci = ir_emit(IR_CALL, 0, 0, 0);
-                ir[ci].name = strdup(fname != NULL ? fname : "");
-                /* Return value from rax */
+                ir[ci].name = strdup(fname);
+                ir_emit(IR_MOV, r, 0, 0);
+            } else {
+                /* Regular function call */
+                int phys_regs[] = {7, 6, 2, 1, 8, 9};
+                int nargs = n->as.call.acount;
+                if (nargs > 6) nargs = 6;
+                for (int i = 0; i < nargs; i++) {
+                    int vr = expr_to_ir(n->as.call.args[i]);
+                    ir_emit(IR_MOV, phys_regs[i], vr, 0);
+                }
+                int ci = ir_emit(IR_CALL, 0, 0, 0);
+                ir[ci].name = strdup(fname ? fname : "");
                 ir_emit(IR_MOV, r, 0, 0);
             }
         }
@@ -865,6 +1350,14 @@ static int expr_to_ir(Node* n) {
         ir_emit(IR_LOAD, r, ptr, 0);
         return r;
     }
+    case N_CAST:
+        /* cast is a compile-time no-op; just evaluate the inner expression */
+        if (n->as.cast.expr) {
+            r = expr_to_ir(n->as.cast.expr);
+        } else {
+            ir_emit(IR_MOVI, r, 0, 0);
+        }
+        return r;
     default:
         ir_emit(IR_MOVI, r, 0, 0);
         return r;
@@ -1137,6 +1630,10 @@ void codegen(Compiler* c, Node* node) {
         if (codegen_arch == TARGET_ARM64) {
             ir_emit(IR_MOVI, 8, 0, 93);   /* x8 = 93 (ARM64 sys_exit) */
             ir_emit(IR_SYSCALL, 0, 0, 0);
+        } else if (codegen_arch == TARGET_ARM32) {
+            ir_emit(IR_MOV, 0, 0, 0);      /* R0 = exit code */
+            ir_emit(IR_MOVI, 7, 0, 1);     /* R7 = 1 (sys_exit) */
+            ir_emit(IR_SYSCALL, 0, 0, 0);
         } else {
             ir_emit(IR_MOV, 7, 0, 0);      /* rdi = rax (exit code) */
             ir_emit(IR_MOVI, 0, 0, 60);    /* rax = 60 (sys_exit) */
@@ -1172,6 +1669,10 @@ void codegen(Compiler* c, Node* node) {
         if (codegen_arch == TARGET_ARM64) {
             ir_emit(IR_MOVI, 8, 0, 93);
             ir_emit(IR_SYSCALL, 0, 0, 0);
+        } else if (codegen_arch == TARGET_ARM32) {
+            ir_emit(IR_MOV, 0, 0, 0);
+            ir_emit(IR_MOVI, 7, 0, 1);
+            ir_emit(IR_SYSCALL, 0, 0, 0);
         } else {
             ir_emit(IR_MOV, 7, 0, 0);
             ir_emit(IR_MOVI, 0, 0, 60);
@@ -1195,6 +1696,8 @@ void codegen(Compiler* c, Node* node) {
     /* Translate to target machine code */
     if (codegen_arch == TARGET_ARM64) {
         ir_to_arm64();
+    } else if (codegen_arch == TARGET_ARM32) {
+        ir_to_arm32();
     } else {
         ir_to_x86_64();
     }
@@ -1226,6 +1729,35 @@ static int a64_map(int r) {
     return r;                 /* x0-x15 map directly */
 }
 
+/* Map x86 virtual register numbers to ARM32 (ARM mode) registers.
+   Fixed mapping:
+     RAX(0)→R0, RCX(1)→R1, RDX(2)→R2, RBX(3)→R3,
+     RSP(4)→R13(SP), RBP(5)→R11(FP),
+     RSI(6)→R6, RDI(7)→R7,
+     vregs 8-13 → R8,R9,R10,R4,R5,R12 (IP)
+     vreg 14,15 → alias to R4,R5 */
+static int arm32_map(int r) {
+    switch (r) {
+        case 0:  return 0;   /* RAX → R0 */
+        case 1:  return 1;   /* RCX → R1 */
+        case 2:  return 2;   /* RDX → R2 */
+        case 3:  return 3;   /* RBX → R3 */
+        case 4:  return 13;  /* RSP → R13(SP) */
+        case 5:  return 11;  /* RBP → R11(FP) */
+        case 6:  return 6;   /* RSI → R6 */
+        case 7:  return 7;   /* RDI → R7 */
+        case 8:  return 8;   /* vreg → R8 */
+        case 9:  return 9;   /* vreg → R9 */
+        case 10: return 10;  /* vreg → R10 */
+        case 11: return 4;   /* vreg → R4 */
+        case 12: return 5;   /* vreg → R5 */
+        case 13: return 12;  /* vreg → R12(IP) */
+        case 14: return 4;   /* vreg → R4 (alias) */
+        case 15: return 5;   /* vreg → R5 (alias) */
+        default: return r;
+    }
+}
+
 void resolve_fixups(Compiler* c) {
     (void)c;
 }
@@ -1245,17 +1777,14 @@ void emit_raw_binary(Compiler* c, const char* outpath, uint64_t entry_override) 
 }
 
 void emit_catarch_binary(Compiler* c, const char* outpath, uint64_t entry_override) {
-    (void)c;
-    /* Write as standard ELF64 x86_64 executable — no .comment, no section
-       headers, no symbol tables. The output is indistinguishable from any
-       other minimal ELF binary: no compiler branding, no custom metadata. */
     int total = code_len;
     int entry_point = 0;
+    int is_shared = c ? c->shared : 0;
     
     /* Find entry point: prefer _start, fallback main, or entry_override */
     if (entry_override != 0) {
         entry_point = (int)(entry_override - 0x400000 - 128);
-    } else {
+    } else if (!is_shared) {
         for (int i = 0; i < ir_n; i++) {
             if (ir[i].op == IR_LABEL && ir[i].name) {
                 if (strcmp(ir[i].name, "_start") == 0) {
@@ -1267,32 +1796,76 @@ void emit_catarch_binary(Compiler* c, const char* outpath, uint64_t entry_overri
     }
 
     int code_off = 128;
+    uint64_t base_addr = is_shared ? 0 : 0x400000;
 
-    /* ELF64 header — standard values throughout */
+    if (codegen_arch == TARGET_ARM32) {
+        /* ELF32 header (52 bytes) */
+        uint8_t hdr[128];
+        memset(hdr, 0, 128);
+        hdr[0] = 0x7F; hdr[1] = 'E'; hdr[2] = 'L'; hdr[3] = 'F';
+        hdr[4] = 1; hdr[5] = 1; hdr[6] = 1;
+        *(uint16_t*)(hdr + 16) = is_shared ? 3 : 2;
+        *(uint16_t*)(hdr + 18) = 0x28;  /* EM_ARM */
+        *(uint32_t*)(hdr + 20) = 1;
+        *(uint32_t*)(hdr + 24) = (uint32_t)(base_addr + code_off + (int64_t)entry_point);
+        *(uint32_t*)(hdr + 28) = 52;    /* e_phoff */
+        *(uint32_t*)(hdr + 32) = 0;     /* e_shoff */
+        *(uint32_t*)(hdr + 36) = 0;     /* e_flags */
+        *(uint16_t*)(hdr + 40) = 52;    /* e_ehsize */
+        *(uint16_t*)(hdr + 42) = 32;    /* e_phentsize */
+        *(uint16_t*)(hdr + 44) = 1;     /* e_phnum */
+        *(uint16_t*)(hdr + 46) = 40;    /* e_shentsize */
+        *(uint16_t*)(hdr + 48) = 0;     /* e_shnum */
+        *(uint16_t*)(hdr + 50) = 0;     /* e_shstrndx */
+
+        /* Program header (PT_LOAD, 32 bytes) */
+        *(uint32_t*)(hdr + 52) = 1;     /* p_type */
+        *(uint32_t*)(hdr + 56) = 0;     /* p_offset */
+        *(uint32_t*)(hdr + 60) = (uint32_t)base_addr;  /* p_vaddr */
+        *(uint32_t*)(hdr + 64) = (uint32_t)base_addr;  /* p_paddr */
+        *(uint32_t*)(hdr + 68) = code_off + total;     /* p_filesz */
+        *(uint32_t*)(hdr + 72) = code_off + total;     /* p_memsz */
+        *(uint32_t*)(hdr + 76) = 5;      /* p_flags = RX */
+        *(uint32_t*)(hdr + 80) = 0x1000; /* p_align */
+
+        FILE* f = fopen(outpath, "wb");
+        if (!f) { fprintf(stderr, "error: cannot write %s\n", outpath); return; }
+        fwrite(hdr, 1, 128, f);
+        for (int i = 128; i < code_off; i++) fputc(0, f);
+        fwrite(code, 1, code_len, f);
+        fclose(f);
+        chmod(outpath, 0755);
+        fprintf(stderr, "forge: wrote %s (%d bytes, %s)\n",
+               outpath, code_off + code_len,
+               is_shared ? "shared object" : "executable");
+        return;
+    }
+
+    /* ELF64 header */
     uint8_t hdr[128];
     memset(hdr, 0, 128);
     hdr[0] = 0x7F; hdr[1] = 'E'; hdr[2] = 'L'; hdr[3] = 'F';
     hdr[4] = 2; hdr[5] = 1; hdr[6] = 1;
-    *(uint16_t*)(hdr + 16) = 2;  /* ET_EXEC */
+    *(uint16_t*)(hdr + 16) = is_shared ? 3 : 2;  /* ET_DYN or ET_EXEC */
     if (codegen_arch == TARGET_ARM64) {
         *(uint16_t*)(hdr + 18) = 0xB7;  /* EM_AARCH64 */
     } else {
         *(uint16_t*)(hdr + 18) = 0x3E;  /* EM_X86_64 */
     }
     *(uint32_t*)(hdr + 20) = 1;
-    *(uint64_t*)(hdr + 24) = 0x400000 + code_off + entry_point;
+    *(uint64_t*)(hdr + 24) = base_addr + code_off + entry_point;
     *(uint64_t*)(hdr + 32) = 64;
     hdr[52] = 64; hdr[53] = 0;
     hdr[54] = 56; hdr[55] = 0;
     hdr[56] = 1; hdr[57] = 0;
 
-    /* Program header (PT_LOAD) — standard values */
+    /* Program header (PT_LOAD) */
     memset(hdr + 64, 0, 56);
     *(uint32_t*)(hdr + 64) = 1;
     *(uint32_t*)(hdr + 68) = 5;
     *(uint64_t*)(hdr + 72) = 0;
-    *(uint64_t*)(hdr + 80) = 0x400000;
-    *(uint64_t*)(hdr + 88) = 0x400000;
+    *(uint64_t*)(hdr + 80) = base_addr;
+    *(uint64_t*)(hdr + 88) = base_addr;
     *(uint64_t*)(hdr + 96) = code_off + total;
     *(uint64_t*)(hdr + 104) = code_off + total;
     *(uint64_t*)(hdr + 112) = 0x1000;
@@ -1300,11 +1873,11 @@ void emit_catarch_binary(Compiler* c, const char* outpath, uint64_t entry_overri
     FILE* f = fopen(outpath, "wb");
     if (!f) { fprintf(stderr, "error: cannot write %s\n", outpath); return; }
     fwrite(hdr, 1, 128, f);
-    /* Zero pad — standard, no identifiable pattern */
     for (int i = 128; i < code_off; i++) fputc(0, f);
     fwrite(code, 1, code_len, f);
     fclose(f);
     chmod(outpath, 0755);
-    fprintf(stderr, "forge: wrote %s (%d bytes, entry=0x%x)\n",
-           outpath, code_off + code_len, 0x400000 + code_off + entry_point);
+    fprintf(stderr, "forge: wrote %s (%d bytes, %s)\n",
+           outpath, code_off + code_len,
+           is_shared ? "shared object" : "executable");
 }
